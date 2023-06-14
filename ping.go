@@ -18,7 +18,7 @@ import (
 type Packet struct {
 	nBytes int
 	msg    []byte
-	TTL    int
+	ttl    int
 	seq    int
 	rtt    time.Duration
 }
@@ -38,6 +38,10 @@ func NewPinger(address string, options ...OptionsFunc) (*Pinger, error) {
 	return pinger, pinger.resolve()
 }
 
+func (p *Pinger) Stop() {
+	close(p.quit)
+}
+
 func (p *Pinger) resolve() error {
 	if len(p.address) == 0 {
 		return errors.New("empty address")
@@ -45,6 +49,9 @@ func (p *Pinger) resolve() error {
 
 	ipaddr, err := net.ResolveIPAddr("ip", p.address)
 	if err != nil {
+		// if _, ok := err.(*net.DNSError); ok {
+		// 	// TODO
+		// }
 		return err
 	}
 
@@ -55,31 +62,33 @@ func (p *Pinger) resolve() error {
 }
 
 func (p *Pinger) RunPing() error {
-	conn, err := p.Listen()
+	defer p.PrintStatistics()
+	conn, err := p.listen()
 	if err != nil {
 		return err
 	}
+	defer conn.Close()
 
 	if err := conn.IPv4PacketConn().SetTTL(p.ttl); err != nil {
 		return err
 	}
 	conn.IPv4PacketConn().SetControlMessage(ipv4.FlagTTL, true)
 
-	recv := make(chan *Packet, 5)
+	recv := make(chan *Packet, 1)
 
-	wg := sync.WaitGroup{}
+	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		if err := p.Ping(conn, recv); err != nil {
+		if err := p.ping(conn, recv); err != nil {
 			fmt.Println("ERROR: ", err)
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		if err := p.RecvICMPPacket(conn, recv); err != nil {
+		if err := p.recvICMPPacket(conn, recv); err != nil {
 			fmt.Println("ERROR: ", err)
 		}
 	}()
@@ -89,30 +98,47 @@ func (p *Pinger) RunPing() error {
 	return nil
 }
 
-func (p *Pinger) Ping(conn *icmp.PacketConn, recv <-chan *Packet) error {
+func (p *Pinger) ping(conn *icmp.PacketConn, recv <-chan *Packet) error {
+	fmt.Printf("Pinging %s (%s) with %d bytes of payload:\n\n", p.address, p.ipaddr.IP.String(), p.size)
 	interval := time.NewTicker(p.interval)
 	timeout := time.NewTicker(p.timeout)
+	defer func() {
+		interval.Stop()
+		timeout.Stop()
+	}()
 
-	if err := p.SendICMPPacket(conn); err != nil {
+	if err := p.sendICMPPacket(conn); err != nil {
 		return err
 	}
 
 	for {
 		select {
 		case <-interval.C:
-			if err := p.SendICMPPacket(conn); err != nil {
+			if err := p.sendICMPPacket(conn); err != nil {
 				fmt.Println("ERROR: ", err)
 			}
+		case <-p.quit:
+			return nil
 		case <-timeout.C:
 			fmt.Println("TIMEOUT")
 			return nil
 		case r := <-recv:
-			fmt.Printf("Echo reply from %s: bytes=%d time=%v ttl=%d icmp_seq=%d\n", p.ipaddr.IP.String(), r.nBytes, r.rtt, r.TTL, r.seq)
+			fmt.Printf("Echo reply from %s: bytes=%d time=%v ttl=%d icmp_seq=%d\n", p.ipaddr.IP.String(), r.nBytes, r.rtt, r.ttl, r.seq)
 		}
 	}
 }
 
-func (p *Pinger) SendICMPPacket(conn *icmp.PacketConn) error {
+func (p *Pinger) PrintStatistics() {
+	loss := float64(p.pktsSent-p.pktsRecv) / float64(p.pktsSent) * 100
+	avg := getAvg(p.rtts)
+	mdev := calculateMdev(p.rtts)
+	fmt.Printf("\n--- %s ping packets statistics ---\n", p.address)
+	fmt.Printf("%d packets transmitted, %d received, (%d%%)%d packet loss\n", p.pktsSent, p.pktsRecv, int(loss), p.pktsSent-p.pktsRecv)
+	fmt.Printf("--- %s ping rtt statistics ---\n", p.address)
+	fmt.Printf("min %v, max %v, avg %v, mdev %v\n", p.minRtt, p.maxRtt, time.Duration(avg), time.Duration(mdev))
+}
+
+func (p *Pinger) sendICMPPacket(conn *icmp.PacketConn) error {
 	uuidEncoded, _ := uuid.UUID{}.MarshalBinary()
 	bodyBytes := append(timeToBytes(time.Now()), uuidEncoded...)
 	if remainSize := p.size - 24; remainSize > 0 {
@@ -136,12 +162,23 @@ func (p *Pinger) SendICMPPacket(conn *icmp.PacketConn) error {
 	}
 
 	for {
+		if err := conn.SetWriteDeadline(time.Now().Add(4000 * time.Millisecond)); err != nil {
+			return err
+		}
+
+		p.pktsSent++
 		if _, err = conn.WriteTo(msgBytes, p.ipaddr); err != nil {
 			if neterr, ok := err.(*net.OpError); ok {
+				if neterr.Timeout() {
+					fmt.Println("Sent request timed out.")
+					continue
+				}
 				if neterr.Err == syscall.ENOBUFS {
+					fmt.Println("ENOBUFS")
 					continue
 				}
 			}
+
 			return err
 		}
 
@@ -152,56 +189,86 @@ func (p *Pinger) SendICMPPacket(conn *icmp.PacketConn) error {
 	return nil
 }
 
-func (p *Pinger) RecvICMPPacket(conn *icmp.PacketConn, recv chan<- *Packet) error {
+func (p *Pinger) recvICMPPacket(conn *icmp.PacketConn, recv chan<- *Packet) error {
 	proto := ipv4.ICMPTypeEchoReply.Protocol()
 	if !p.ipv4 {
 		proto = ipv6.ICMPTypeEchoReply.Protocol()
 	}
 
 	for {
-		recvBytes := make([]byte, p.size+28)
-		n, _, err := conn.ReadFrom(recvBytes)
-		if err != nil {
-			return err
-		}
+		select {
+		case <-p.quit:
+			return nil
+		default:
+			recvBytes := make([]byte, p.size+28)
 
-		recvMsg, err := icmp.ParseMessage(proto, recvBytes[:n])
-		if err != nil {
-			return err
-		}
+			if err := conn.SetReadDeadline(time.Now().Add(time.Millisecond * 100)); err != nil {
+				return err
+			}
+			n, _, err := conn.ReadFrom(recvBytes)
+			if err != nil {
+				if neterr, ok := err.(*net.OpError); ok {
+					if neterr.Timeout() {
+						// Request timed out.
+						continue
+					}
+					p.Stop()
+					return err
+				}
+			}
 
-		switch recvMsg.Body.(type) {
-		case *icmp.Echo:
-			echoReply, _ := recvMsg.Body.(*icmp.Echo)
-
-			TTL, err := conn.IPv4PacketConn().TTL()
+			recvMsg, err := icmp.ParseMessage(proto, recvBytes[:n])
 			if err != nil {
 				return err
 			}
-			receivedAt := time.Now()
-			timestamp := bytesToTime(echoReply.Data[:8])
 
-			recv <- &Packet{
-				nBytes: len(echoReply.Data),
-				msg:    recvBytes,
-				TTL:    TTL,
-				seq:    echoReply.Seq,
-				rtt:    receivedAt.Sub(timestamp),
+			if echoReply, ok := recvMsg.Body.(*icmp.Echo); ok {
+				headers, _ := ipv4.ParseHeader(recvBytes)
+				// TTL, err := conn.IPv4PacketConn().TTL()
+				// if err != nil {
+				// 	return err
+				// }
+				receivedAt := time.Now()
+				timestamp := bytesToTime(echoReply.Data[:8])
+				rtt := receivedAt.Sub(timestamp)
+				pkt := &Packet{
+					nBytes: len(echoReply.Data),
+					msg:    recvBytes,
+					ttl:    headers.TTL, // TODO
+					seq:    echoReply.Seq,
+					rtt:    rtt,
+				}
+				recv <- pkt
+
+				p.pktsRecv++
+				p.statsUpdate(pkt)
 			}
-		default:
-			fmt.Println("not an echo reply", recvMsg)
 		}
 	}
 }
 
-func (p *Pinger) Listen() (*icmp.PacketConn, error) {
+func (p *Pinger) statsUpdate(pkt *Packet) {
+	p.statsLock.Lock()
+	defer p.statsLock.Unlock()
+
+	p.rtts = append(p.rtts, pkt.rtt)
+	if p.pktsRecv == 1 || pkt.rtt < p.minRtt {
+		p.minRtt = pkt.rtt
+	}
+
+	if pkt.rtt > p.maxRtt {
+		p.maxRtt = pkt.rtt
+	}
+}
+
+func (p *Pinger) listen() (*icmp.PacketConn, error) {
 	var (
 		conn *icmp.PacketConn
 		err  error
 	)
-	conn, err = icmp.ListenPacket(ipv4Map[p.protocol], p.listen)
+	conn, err = icmp.ListenPacket(ipv4Map[p.protocol], p.listenAddr)
 	if !p.ipv4 {
-		conn, err = icmp.ListenPacket(ipv6Map[p.protocol], p.listen)
+		conn, err = icmp.ListenPacket(ipv6Map[p.protocol], p.listenAddr)
 	}
 	if err != nil {
 		return nil, err

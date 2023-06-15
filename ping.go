@@ -39,7 +39,10 @@ func NewPinger(address string, options ...OptionsFunc) (*Pinger, error) {
 }
 
 func (p *Pinger) Stop() {
-	close(p.quit)
+	p.statsLock.Lock()
+	defer p.statsLock.Unlock()
+
+	p.quit <- struct{}{}
 }
 
 func (p *Pinger) resolve() error {
@@ -80,14 +83,20 @@ func (p *Pinger) RunPing() error {
 	wg.Add(2)
 
 	go func() {
-		defer wg.Done()
+		defer func() {
+			wg.Done()
+			p.Stop()
+		}()
 		if err := p.ping(conn, recv); err != nil {
 			fmt.Println("ERROR: ", err)
 		}
 	}()
 
 	go func() {
-		defer wg.Done()
+		defer func() {
+			wg.Done()
+			p.Stop()
+		}()
 		if err := p.recvICMPPacket(conn, recv); err != nil {
 			fmt.Println("ERROR: ", err)
 		}
@@ -120,10 +129,13 @@ func (p *Pinger) ping(conn *icmp.PacketConn, recv <-chan *Packet) error {
 		case <-p.quit:
 			return nil
 		case <-timeout.C:
-			fmt.Println("TIMEOUT")
 			return nil
 		case r := <-recv:
 			fmt.Printf("Echo reply from %s: bytes=%d time=%v ttl=%d icmp_seq=%d\n", p.ipaddr.IP.String(), r.nBytes, r.rtt, r.ttl, r.seq)
+		default:
+			if p.pktsRecv == p.pktCount && p.pktCount > 0 {
+				return nil
+			}
 		}
 	}
 }

@@ -48,6 +48,8 @@ type Options struct {
 	ttl int
 	// size of payload
 	size int
+	// packets count
+	pktCount int
 	// "icmp" or "udp".
 	protocol string
 	// target address
@@ -76,7 +78,7 @@ func defaultOptions() *Options {
 		// The ICMP ID of the ping utility is defined equal to the process ID which is generated when ping is started.
 		id:         os.Getpid() & 0xffff,
 		seq:        0,
-		interval:   1,
+		interval:   time.Second,
 		timeout:    time.Duration(math.MaxInt64),
 		protocol:   protocol,
 		listenAddr: "0.0.0.0",
@@ -86,6 +88,7 @@ func defaultOptions() *Options {
 		pktsSent:   0,
 		pktsRecv:   0,
 		rtts:       []time.Duration{},
+		pktCount:   -1,
 	}
 }
 
@@ -104,5 +107,17 @@ func WithTTl(i int) OptionsFunc {
 func WithSize(s int) OptionsFunc {
 	return func(o *Options) {
 		o.size = s
+	}
+}
+
+func WithTimeout(t time.Duration) OptionsFunc {
+	return func(o *Options) {
+		o.timeout = t
+	}
+}
+
+func WithCount(c int) OptionsFunc {
+	return func(o *Options) {
+		o.pktCount = c
 	}
 }

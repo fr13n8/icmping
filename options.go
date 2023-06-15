@@ -83,12 +83,13 @@ func defaultOptions() *Options {
 		protocol:   protocol,
 		listenAddr: "0.0.0.0",
 		ipv4:       false,
-		size:       24,
+		size:       32,
 		quit:       make(chan struct{}),
 		pktsSent:   0,
 		pktsRecv:   0,
 		rtts:       []time.Duration{},
 		pktCount:   -1,
+		ttl:        128,
 	}
 }
 

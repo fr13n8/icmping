@@ -5,7 +5,7 @@ A simple ICMP echo (ping) implementation in Go
 ## Build
 
 ```
-go build -ldflags "-s -w" .\cmd\icmping.go
+go build -ldflags "-s -w" ./cmd/icmping.go
 ```
 
 ### Linux
